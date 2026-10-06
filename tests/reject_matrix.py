@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """W4 rejection matrix: runs the 7 rows against the deployed host and prints a pasteable report.
 
+Row 5 expects the W4 answer (409). From W5 on an identical resend returns 200, so use
+tests/idempotency_matrix.py for the W5 version of the service.
+
 Tokens are read from .local/app.env and are never printed; neither are request headers.
 """
 import argparse

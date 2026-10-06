@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small in-memory inspection event API for the W4 contract."""
+"""Inspection event API: the W4 contract, stored in PostgreSQL with idempotent POST (W5)."""
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import threading
 from urllib.parse import unquote, urlsplit
 
@@ -15,6 +16,9 @@ MAX_BODY_BYTES = 4 * 1024
 EVENT_FIELDS = {"event_id", "device_id", "observed_at", "type", "note"}
 ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+\Z")
 EVENT_TYPES = {"status", "anomaly", "test"}
+EVENT_COLUMNS = ("event_id", "device_id", "observed_at", "type", "note", "received_at")
+DB_SETTINGS = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
+RDS_CA_FILE = "/etc/inspection/rds-ca.pem"
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-Hant">
@@ -102,17 +106,138 @@ def validate_event(payload):
     return payload, None, None
 
 
-def make_server(version_file, port=8080):
+def same_content(stored, incoming):
+    return all(stored.get(field) == incoming.get(field)
+               for field in ("device_id", "observed_at", "type", "note"))
+
+
+class StoreError(Exception):
+    """Storage failed; carries only a category, never a connection string or password."""
+
+    def __init__(self, category):
+        super().__init__(category)
+        self.category = category
+
+
+class MemoryStore:
+    """Same rules as PostgresStore, kept in memory for offline tests."""
+
+    def __init__(self):
+        self._events = {}
+        self._lock = threading.Lock()
+
+    def add(self, event):
+        with self._lock:
+            stored = self._events.setdefault(event["event_id"], event)
+        if stored is event:
+            return "created", event
+        return ("same", stored) if same_content(stored, event) else ("conflict", None)
+
+    def latest(self, limit):
+        with self._lock:
+            return list(reversed(list(self._events.values())))[:limit]
+
+    def get(self, event_id):
+        with self._lock:
+            return self._events.get(event_id)
+
+
+class PostgresStore:
+    """One short TLS connection per request; every statement is parameterized."""
+
+    CREATE_TABLE = """CREATE TABLE IF NOT EXISTS events (
+        event_id text PRIMARY KEY,
+        device_id text NOT NULL,
+        observed_at text NOT NULL,
+        type text NOT NULL,
+        note text,
+        received_at text NOT NULL)"""
+    INSERT = """INSERT INTO events (event_id, device_id, observed_at, type, note, received_at)
+        VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (event_id) DO NOTHING"""
+    SELECT = "SELECT event_id, device_id, observed_at, type, note, received_at FROM events"
+
+    def __init__(self, environ, ca_file=RDS_CA_FILE):
+        self._connection = {
+            "host": environ["DB_HOST"], "port": environ.get("DB_PORT", "5432"),
+            "dbname": environ["DB_NAME"], "user": environ["DB_USER"], "password": environ["DB_PASSWORD"],
+            "sslmode": "verify-full", "sslrootcert": ca_file, "connect_timeout": 3,
+            "options": "-c statement_timeout=3000"}
+        self._schema_ready = False
+
+    @staticmethod
+    def _category(message):
+        message = message.lower()
+        for category, markers in (("timeout", ("timeout", "timed out")),
+                                  ("authentication", ("password authentication", "pg_hba")),
+                                  ("tls", ("certificate", "ssl")),
+                                  ("name_resolution", ("could not translate host name",))):
+            if any(marker in message for marker in markers):
+                return category
+        return "connection"
+
+    def _run(self, work):
+        import psycopg2  # installed on the host by the packer; not needed for offline tests
+        try:
+            connection = psycopg2.connect(**self._connection)
+        except psycopg2.OperationalError as exc:
+            # The driver's message can name the host and user, so only its category leaves here.
+            raise StoreError(self._category(str(exc))) from None
+        try:
+            with connection, connection.cursor() as cursor:
+                if not self._schema_ready:
+                    cursor.execute(self.CREATE_TABLE)
+                result = work(cursor)
+            self._schema_ready = True  # only after the transaction that created the table committed
+            return result
+        except psycopg2.Error:
+            raise StoreError("sql") from None
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _event(row):
+        event = dict(zip(EVENT_COLUMNS, row))
+        if event["note"] is None:
+            del event["note"]
+        return event
+
+    def add(self, event):
+        def work(cursor):
+            # The primary key decides whether this is a duplicate; there is no check-then-insert.
+            cursor.execute(self.INSERT, tuple(event.get(column) for column in EVENT_COLUMNS))
+            if cursor.rowcount == 1:
+                return "created", event
+            cursor.execute(self.SELECT + " WHERE event_id = %s", (event["event_id"],))
+            stored = self._event(cursor.fetchone())
+            return ("same", stored) if same_content(stored, event) else ("conflict", None)
+        return self._run(work)
+
+    def latest(self, limit):
+        def work(cursor):
+            cursor.execute(self.SELECT + " ORDER BY received_at DESC, event_id DESC LIMIT %s", (limit,))
+            return [self._event(row) for row in cursor.fetchall()]
+        return self._run(work)
+
+    def get(self, event_id):
+        def work(cursor):
+            cursor.execute(self.SELECT + " WHERE event_id = %s", (event_id,))
+            row = cursor.fetchone()
+            return self._event(row) if row else None
+        return self._run(work)
+
+
+def make_server(version_file, port=8080, store=None, environ=None):
+    environ = os.environ if environ is None else environ
     version = Path(version_file).read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", version):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
     started = utc_now()
-    reporter_token = os.environ.get("REPORTER_TOKEN", "")
-    operator_token = os.environ.get("OPERATOR_TOKEN", "")
+    reporter_token = environ.get("REPORTER_TOKEN", "")
+    operator_token = environ.get("OPERATOR_TOKEN", "")
     auth_configured = bool(reporter_token and operator_token and reporter_token != operator_token)
-    events = []
-    events_by_id = {}
-    events_lock = threading.Lock()
+    # Without the database secrets the service still starts and reports db_configured=false.
+    if store is None and all(environ.get(name) for name in DB_SETTINGS):
+        store = PostgresStore(environ)
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -150,6 +275,18 @@ def make_server(version_file, port=8080):
                 return False
             return True
 
+        def use_store(self, action):
+            """Run one storage action and wrap its result in a tuple; on failure answer 503."""
+            if store is None:
+                self.send_error_json(503, "database_not_configured")
+                return None
+            try:
+                return (action(store),)
+            except StoreError as exc:
+                print("storage error category: " + exc.category, file=sys.stderr, flush=True)
+                self.send_error_json(503, "database_unavailable")
+                return None
+
         def read_event_body(self):
             if self.headers.get_content_type() != "application/json":
                 self.send_error_json(400, "content_type_must_be_application_json", "Content-Type")
@@ -180,7 +317,8 @@ def make_server(version_file, port=8080):
             path = urlsplit(self.path).path
             if path == "/health":
                 self.send_json(200, {"status": "ok", "service": "inspection", "version": version,
-                                     "started_at": started, "auth_configured": auth_configured})
+                                     "started_at": started, "auth_configured": auth_configured,
+                                     "db_configured": store is not None})
                 return
             if path == "/":
                 data = INDEX_HTML.encode("utf-8")
@@ -196,20 +334,21 @@ def make_server(version_file, port=8080):
                 if not self.require_role("operator"):
                     return
                 if path == "/events":
-                    with events_lock:
-                        latest = list(reversed(events[-50:]))
-                    self.send_json(200, {"events": latest})
+                    listed = self.use_store(lambda current: current.latest(50))
+                    if listed:
+                        self.send_json(200, {"events": listed[0]})
                     return
                 event_id = unquote(path[len("/events/"):])
                 if not ID_PATTERN.fullmatch(event_id) or len(event_id) > 64:
                     self.send_error_json(404, "not_found")
                     return
-                with events_lock:
-                    event = events_by_id.get(event_id)
-                if event is None:
+                found = self.use_store(lambda current: current.get(event_id))
+                if not found:
+                    return
+                if found[0] is None:
                     self.send_error_json(404, "not_found")
                     return
-                self.send_json(200, event)
+                self.send_json(200, found[0])
                 return
             self.send_error_json(404, "not_found")
 
@@ -228,13 +367,15 @@ def make_server(version_file, port=8080):
                 return
             event = dict(validated)
             event["received_at"] = utc_now()
-            with events_lock:
-                if event["event_id"] in events_by_id:
-                    self.send_error_json(409, "duplicate_event_id", "event_id")
-                    return
-                events.append(event)
-                events_by_id[event["event_id"]] = event
-            self.send_json(201, event)
+            added = self.use_store(lambda current: current.add(event))
+            if not added:
+                return
+            outcome, stored = added[0]
+            if outcome == "conflict":
+                self.send_error_json(409, "duplicate_event_id", "event_id")
+                return
+            # A resend with identical content gets the stored event back and adds nothing.
+            self.send_json(201 if outcome == "created" else 200, stored)
 
         def log_message(self, fmt, *args):
             pass
