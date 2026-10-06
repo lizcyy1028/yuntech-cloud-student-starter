@@ -1,0 +1,7 @@
+{
+  "event_id": "g7-m03-0001",
+  "device_id": "g7-d01",
+  "observed_at": "2026-10-06T10:00:00+08:00",
+  "type": "status",
+  "note": "pump room routine check, no anomaly"
+}
