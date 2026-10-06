@@ -113,7 +113,11 @@ def confirm(description, token, supplied=None):
         return
     if not sys.stdin.isatty():
         raise LabError(f"No interactive approval. Review the list above, then re-run with --confirm {token}")
-    if input(f"Type exactly {token} to proceed: ").strip() != token:
+    try:
+        answer = input(f"Type exactly {token} to proceed: ").strip()
+    except EOFError:
+        answer = ""
+    if answer != token:
         raise LabError("Cancelled; no changes made.")
 
 
