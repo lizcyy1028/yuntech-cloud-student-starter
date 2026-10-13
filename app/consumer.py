@@ -46,7 +46,8 @@ def handle(payload, device_ids, post):
     logged_id = event_id if isinstance(event_id, str) and ID_PATTERN.fullmatch(event_id) else "invalid"
     # device_id is only a claim inside the message: the gateway certificate does not prove it,
     # so it must be on this consumer's own list before anything is sent to the API.
-    if event.get("device_id") not in device_ids:
+    device_id = event.get("device_id")
+    if not isinstance(device_id, str) or device_id not in device_ids:
         return logged_id, "rejected"
     return logged_id, classify(post(json.dumps(event).encode("utf-8")))
 
