@@ -152,8 +152,12 @@ def running_host(cfg, resources):
 
 def read_env(path):
     """KEY=VALUE pairs from a secret file. Callers must never print the values."""
+    return read_env_text(Path(path).read_text(encoding="utf-8"))
+
+
+def read_env_text(text):
     values = {}
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         key, separator, value = line.strip().partition("=")
         if separator and key and not key.startswith("#"):
             values[key] = value
@@ -188,14 +192,14 @@ def ssh_command(cfg, host, *options):
             f"{cfg.get('ssh_user', 'ec2-user')}@{host}"]
 
 
-def ssh_run(cfg, host, command, stdin=b"", label="remote step", timeout=900):
+def ssh_run(cfg, host, command, stdin=b"", label="remote step", timeout=900, allow_failure=False):
     """Run one remote command. stdin carries scripts and secrets so they never reach argv."""
     try:
         result = subprocess.run(ssh_command(cfg, host) + [command], input=stdin, capture_output=True,
                                 timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise LabError(f"SSH timed out during {label}.") from exc
-    if result.returncode:
+    if result.returncode and not allow_failure:
         # Remote stderr is not echoed: it could repeat input that was sent on stdin.
         raise LabError(f"SSH failed during {label} (exit {result.returncode}). Check SG source, key and host state.")
     return result.stdout.decode("utf-8", "replace")
