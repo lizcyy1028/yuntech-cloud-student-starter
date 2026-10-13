@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import sys
 import threading
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 MAX_BODY_BYTES = 4 * 1024
@@ -32,12 +32,15 @@ INDEX_HTML = r"""<!doctype html>
         <h1>&#24033;&#27298;&#20107;&#20214;</h1>
         <label for="operator-token">Operator &#27402;&#26454;</label>
     <input id="operator-token" type="password" autocomplete="off">
+        <label for="device-id">&#35373;&#20633;&#32232;&#34399;</label>
+    <input id="device-id" type="text" autocomplete="off" maxlength="32">
         <button id="load-events" type="button">&#35712;&#21462;&#20107;&#20214;</button>
     <p id="status" role="status" aria-live="polite"></p>
     <ol id="events"></ol>
   </main>
   <script>
     const tokenInput = document.querySelector("#operator-token");
+    const deviceInput = document.querySelector("#device-id");
     const status = document.querySelector("#status");
     const eventList = document.querySelector("#events");
 
@@ -45,7 +48,9 @@ INDEX_HTML = r"""<!doctype html>
     status.textContent = "\u8f09\u5165\u4e2d\u2026";
       eventList.replaceChildren();
       try {
-        const response = await fetch("/events", {
+        const deviceId = deviceInput.value.trim();
+        const url = deviceId ? `/events?device_id=${encodeURIComponent(deviceId)}` : "/events";
+        const response = await fetch(url, {
           headers: { Authorization: `Bearer ${tokenInput.value}` }
         });
         if (!response.ok) {
@@ -133,9 +138,12 @@ class MemoryStore:
             return "created", event
         return ("same", stored) if same_content(stored, event) else ("conflict", None)
 
-    def latest(self, limit):
+    def latest(self, limit, device_id=None):
         with self._lock:
-            return list(reversed(list(self._events.values())))[:limit]
+            newest_first = sorted(reversed(list(self._events.values())),
+                                  key=lambda event: event["received_at"], reverse=True)
+        return [event for event in newest_first
+                if device_id is None or event["device_id"] == device_id][:limit]
 
     def get(self, event_id):
         with self._lock:
@@ -212,9 +220,13 @@ class PostgresStore:
             return ("same", stored) if same_content(stored, event) else ("conflict", None)
         return self._run(work)
 
-    def latest(self, limit):
+    def latest(self, limit, device_id=None):
         def work(cursor):
-            cursor.execute(self.SELECT + " ORDER BY received_at DESC, event_id DESC LIMIT %s", (limit,))
+            newest_first = " ORDER BY received_at DESC, event_id DESC LIMIT %s"
+            if device_id is None:
+                cursor.execute(self.SELECT + newest_first, (limit,))
+            else:
+                cursor.execute(self.SELECT + " WHERE device_id = %s" + newest_first, (device_id, limit))
             return [self._event(row) for row in cursor.fetchall()]
         return self._run(work)
 
@@ -314,7 +326,8 @@ def make_server(version_file, port=8080, store=None, environ=None):
                 return None
 
         def do_GET(self):
-            path = urlsplit(self.path).path
+            url = urlsplit(self.path)
+            path = url.path
             if path == "/health":
                 self.send_json(200, {"status": "ok", "service": "inspection", "version": version,
                                      "started_at": started, "auth_configured": auth_configured,
@@ -334,7 +347,11 @@ def make_server(version_file, port=8080, store=None, environ=None):
                 if not self.require_role("operator"):
                     return
                 if path == "/events":
-                    listed = self.use_store(lambda current: current.latest(50))
+                    device_id = parse_qs(url.query).get("device_id", [None])[-1]
+                    if device_id is not None and not (len(device_id) <= 32 and ID_PATTERN.fullmatch(device_id)):
+                        self.send_error_json(400, "invalid_value", "device_id")
+                        return
+                    listed = self.use_store(lambda current: current.latest(50, device_id))
                     if listed:
                         self.send_json(200, {"events": listed[0]})
                     return

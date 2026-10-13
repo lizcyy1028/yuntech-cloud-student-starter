@@ -189,6 +189,9 @@ class FakeConnection:
             rows.setdefault(parameters[0], tuple(parameters))
         elif "WHERE event_id" in statement:
             self.result = [rows[parameters[0]]] if parameters[0] in rows else []
+        elif "WHERE device_id" in statement:
+            matching = [row for row in reversed(list(rows.values())) if row[1] == parameters[0]]
+            self.result = matching[:parameters[1]]
         elif statement.startswith("SELECT"):
             self.result = list(reversed(list(rows.values())))[:parameters[0]]
 
