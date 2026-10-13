@@ -103,7 +103,8 @@ class DeviceFilter(test_events.ServerCase):
 
     def test_display_page_has_the_device_input(self):
         page = self.call("GET", "/")[1]
-        for expected in ('id="device-id"', "encodeURIComponent", "textContent"):
+        for expected in ('id="device-id"', 'id="clear-token"', 'tokenInput.value = ""', "encodeURIComponent",
+                         "textContent"):
             self.assertIn(expected, page)
 
 

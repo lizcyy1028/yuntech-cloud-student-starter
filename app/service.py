@@ -32,6 +32,7 @@ INDEX_HTML = r"""<!doctype html>
         <h1>&#24033;&#27298;&#20107;&#20214;</h1>
         <label for="operator-token">Operator &#27402;&#26454;</label>
     <input id="operator-token" type="password" autocomplete="off">
+        <button id="clear-token" type="button">&#28165;&#31354;&#27402;&#26454;</button>
         <label for="device-id">&#35373;&#20633;&#32232;&#34399;</label>
     <input id="device-id" type="text" autocomplete="off" maxlength="32">
         <button id="load-events" type="button">&#35712;&#21462;&#20107;&#20214;</button>
@@ -43,6 +44,11 @@ INDEX_HTML = r"""<!doctype html>
     const deviceInput = document.querySelector("#device-id");
     const status = document.querySelector("#status");
     const eventList = document.querySelector("#events");
+
+    // Empties only the token box; the events already shown stay on the page.
+    document.querySelector("#clear-token").addEventListener("click", () => {
+      tokenInput.value = "";
+    });
 
     document.querySelector("#load-events").addEventListener("click", async () => {
     status.textContent = "\u8f09\u5165\u4e2d\u2026";
